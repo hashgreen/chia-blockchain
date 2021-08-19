@@ -18,7 +18,7 @@ from chia.server.outbound_message import Message
 from chia.simulator.simulator_protocol import FarmNewBlockProtocol
 from chia.types.announcement import Announcement
 from chia.types.blockchain_format.coin import Coin
-from chia.types.blockchain_format.sized_bytes import bytes32
+from chia.types.blockchain_format.sized_bytes import bytes32, bytes48
 from chia.types.coin_spend import CoinSpend
 from chia.types.condition_opcodes import ConditionOpcode
 from chia.types.condition_with_args import ConditionWithArgs
@@ -31,7 +31,6 @@ from chia.util.hash import std_hash
 from chia.types.mempool_inclusion_status import MempoolInclusionStatus
 from chia.util.api_decorators import api_request, peer_required, bytes_required
 from chia.full_node.mempool_check_conditions import get_name_puzzle_conditions
-from chia.types.name_puzzle_condition import NPC
 from chia.full_node.pending_tx_cache import PendingTxCache
 from blspy import G2Element
 
@@ -47,8 +46,8 @@ from chia.consensus.condition_costs import ConditionCost
 from chia.types.blockchain_format.program import SerializedProgram
 from clvm_tools import binutils
 from chia.types.generator_types import BlockGenerator
-from clvm.casts import int_from_bytes
 from blspy import G1Element
+from chia.types.spend_bundle_conditions import SpendBundleConditions, Spend
 
 from tests.wallet_tools import WalletTool
 
@@ -114,7 +113,7 @@ def make_item(idx: int, cost: uint64 = uint64(80)) -> MempoolItem:
     return MempoolItem(
         SpendBundle([], G2Element()),
         uint64(0),
-        NPCResult(None, [], cost),
+        NPCResult(None, None, cost),
         cost,
         spend_bundle_name,  # type: ignore[arg-type]
         [],
@@ -590,6 +589,7 @@ class TestMempoolManager:
             guarantee_transaction_block=True,
             farmer_reward_puzzle_hash=reward_ph,
             pool_reward_puzzle_hash=reward_ph,
+            time_per_block=10,
         )
         peer = await connect_and_get_peer(server_1, server_2, bt.config["self_hostname"])
 
@@ -1791,13 +1791,8 @@ class TestGeneratorConditions:
         # at are ignored, including the termination of the list
         npc_result = generator_condition_tester("(80 50 . 1)", height=softfork_height)
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 1
-        opcode = ConditionOpcode(bytes([80]))
-        assert len(npc_result.npc_list[0].conditions) == 1
-        assert npc_result.npc_list[0].conditions[0][0] == opcode
-        assert len(npc_result.npc_list[0].conditions[0][1]) == 1
-        c = npc_result.npc_list[0].conditions[0][1][0]
-        assert c == ConditionWithArgs(opcode=ConditionOpcode.ASSERT_SECONDS_RELATIVE, vars=[bytes([50])])
+        assert len(npc_result.conds.spends) == 1
+        assert npc_result.conds.spends[0].seconds_relative == 50
 
     @pytest.mark.parametrize(
         "mempool,height,operand,expected",
@@ -1843,13 +1838,17 @@ class TestGeneratorConditions:
         )
         print(npc_result)
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 1
-        max_arg = 0
-        assert npc_result.npc_list[0].conditions[0][0] == opcode
-        for c in npc_result.npc_list[0].conditions[0][1]:
-            assert c.opcode == opcode
-            max_arg = max(max_arg, int_from_bytes(c.vars[0]))
-        assert max_arg == 100
+        assert len(npc_result.conds.spends) == 1
+
+        assert len(npc_result.conds.spends) == 1
+        if opcode == ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE:
+            assert npc_result.conds.height_absolute == 100
+        elif opcode == ConditionOpcode.ASSERT_HEIGHT_RELATIVE:
+            assert npc_result.conds.spends[0].height_relative == 100
+        elif opcode == ConditionOpcode.ASSERT_SECONDS_ABSOLUTE:
+            assert npc_result.conds.seconds_absolute == 100
+        elif opcode == ConditionOpcode.ASSERT_SECONDS_RELATIVE:
+            assert npc_result.conds.spends[0].seconds_relative == 100
 
     @pytest.mark.parametrize(
         "opcode",
@@ -1864,10 +1863,9 @@ class TestGeneratorConditions:
         # back. They are either satisified or cause an immediate failure
         npc_result = generator_condition_tester(f'({opcode.value[0]} "{message}") ' * 50, height=softfork_height)
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 1
+        assert len(npc_result.conds.spends) == 1
         # create-announcements and assert-announcements are dropped once
         # validated
-        assert npc_result.npc_list[0].conditions == []
 
     @pytest.mark.parametrize(
         "opcode",
@@ -1885,7 +1883,6 @@ class TestGeneratorConditions:
         npc_result = generator_condition_tester(f'({opcode.value[0]} "{message}") ', height=softfork_height)
         print(npc_result)
         assert npc_result.error == Err.ASSERT_ANNOUNCE_CONSUMED_FAILED.value
-        assert npc_result.npc_list == []
 
     def test_multiple_reserve_fee(self, softfork_height):
         # RESERVE_FEE
@@ -1894,17 +1891,8 @@ class TestGeneratorConditions:
         # with all the fees accumulated
         npc_result = generator_condition_tester(f"({cond} 100) " * 3, height=softfork_height)
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 1
-        opcode = ConditionOpcode(bytes([cond]))
-        reserve_fee = 0
-        assert len(npc_result.npc_list[0].conditions) == 1
-        assert npc_result.npc_list[0].conditions[0][0] == opcode
-        for c in npc_result.npc_list[0].conditions[0][1]:
-            assert c.opcode == opcode
-            reserve_fee += int_from_bytes(c.vars[0])
-
-        assert reserve_fee == 300
-        assert len(npc_result.npc_list[0].conditions[0][1]) == 1
+        assert npc_result.conds.reserve_fee == 300
+        assert len(npc_result.conds.spends) == 1
 
     def test_duplicate_outputs(self, softfork_height):
         # CREATE_COIN
@@ -1914,7 +1902,6 @@ class TestGeneratorConditions:
         puzzle_hash = "abababababababababababababababab"
         npc_result = generator_condition_tester(f'(51 "{puzzle_hash}" 10) ' * 2, height=softfork_height)
         assert npc_result.error == Err.DUPLICATE_OUTPUT.value
-        assert npc_result.npc_list == []
 
     def test_create_coin_cost(self, softfork_height):
         # CREATE_COIN
@@ -1928,7 +1915,8 @@ class TestGeneratorConditions:
         )
         assert npc_result.error is None
         assert npc_result.cost == 20470 + 95 * COST_PER_BYTE + ConditionCost.CREATE_COIN.value
-        assert len(npc_result.npc_list) == 1
+        assert len(npc_result.conds.spends) == 1
+        assert len(npc_result.conds.spends[0].create_coin) == 1
 
         # if we subtract one from max cost, this should fail
         npc_result = generator_condition_tester(
@@ -1950,7 +1938,7 @@ class TestGeneratorConditions:
         )
         assert npc_result.error is None
         assert npc_result.cost == 20512 + 117 * COST_PER_BYTE + ConditionCost.AGG_SIG.value
-        assert len(npc_result.npc_list) == 1
+        assert len(npc_result.conds.spends) == 1
 
         # if we subtract one from max cost, this should fail
         npc_result = generator_condition_tester(
@@ -1976,15 +1964,9 @@ class TestGeneratorConditions:
             generator, MAX_BLOCK_COST_CLVM, cost_per_byte=COST_PER_BYTE, mempool_mode=False, height=softfork_height
         )
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 2
-        opcode = ConditionOpcode.CREATE_COIN
-        for c in npc_result.npc_list:
-            assert c.conditions == [
-                (
-                    opcode.value,
-                    [ConditionWithArgs(opcode, [puzzle_hash.encode("ascii"), bytes([10])])],
-                )
-            ]
+        assert len(npc_result.conds.spends) == 2
+        for s in npc_result.conds.spends:
+            assert s.create_coin == [(puzzle_hash.encode("ascii"), 10, b"")]
 
     def test_create_coin_different_puzzhash(self, softfork_height):
         # CREATE_COIN
@@ -1995,16 +1977,9 @@ class TestGeneratorConditions:
             f'(51 "{puzzle_hash_1}" 5) (51 "{puzzle_hash_2}" 5)', height=softfork_height
         )
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 1
-        opcode = ConditionOpcode.CREATE_COIN
-        assert (
-            ConditionWithArgs(opcode, [puzzle_hash_1.encode("ascii"), bytes([5])])
-            in npc_result.npc_list[0].conditions[0][1]
-        )
-        assert (
-            ConditionWithArgs(opcode, [puzzle_hash_2.encode("ascii"), bytes([5])])
-            in npc_result.npc_list[0].conditions[0][1]
-        )
+        assert len(npc_result.conds.spends) == 1
+        assert (puzzle_hash_1.encode("ascii"), 5, b"") in npc_result.conds.spends[0].create_coin
+        assert (puzzle_hash_2.encode("ascii"), 5, b"") in npc_result.conds.spends[0].create_coin
 
     def test_create_coin_different_amounts(self, softfork_height):
         # CREATE_COIN
@@ -2014,16 +1989,10 @@ class TestGeneratorConditions:
             f'(51 "{puzzle_hash}" 5) (51 "{puzzle_hash}" 4)', height=softfork_height
         )
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 1
-        opcode = ConditionOpcode.CREATE_COIN
-        assert (
-            ConditionWithArgs(opcode, [puzzle_hash.encode("ascii"), bytes([5])])
-            in npc_result.npc_list[0].conditions[0][1]
-        )
-        assert (
-            ConditionWithArgs(opcode, [puzzle_hash.encode("ascii"), bytes([4])])
-            in npc_result.npc_list[0].conditions[0][1]
-        )
+        assert len(npc_result.conds.spends) == 1
+        coins = npc_result.conds.spends[0].create_coin
+        assert (puzzle_hash.encode("ascii"), 5, b"") in coins
+        assert (puzzle_hash.encode("ascii"), 4, b"") in coins
 
     def test_create_coin_with_hint(self, softfork_height):
         # CREATE_COIN
@@ -2031,11 +2000,9 @@ class TestGeneratorConditions:
         hint = "12341234123412341234213421341234"
         npc_result = generator_condition_tester(f'(51 "{puzzle_hash_1}" 5 ("{hint}"))', height=softfork_height)
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 1
-        opcode = ConditionOpcode.CREATE_COIN
-        assert npc_result.npc_list[0].conditions[0][1][0] == ConditionWithArgs(
-            opcode, [puzzle_hash_1.encode("ascii"), bytes([5]), hint.encode("ascii")]
-        )
+        assert len(npc_result.conds.spends) == 1
+        coins = npc_result.conds.spends[0].create_coin
+        assert coins == [(puzzle_hash_1.encode("ascii"), 5, hint.encode("ascii"))]
 
     @pytest.mark.parametrize(
         "mempool,height",
@@ -2051,10 +2018,8 @@ class TestGeneratorConditions:
             print(npc_result)
             if mempool:
                 assert npc_result.error == Err.INVALID_CONDITION.value
-                assert npc_result.npc_list == []
             else:
                 assert npc_result.error is None
-                assert npc_result.npc_list[0].conditions == []
 
 
 # the tests below are malicious generator programs
@@ -2193,13 +2158,16 @@ class TestMaliciousGenerators:
             assert npc_result.error == error_for_condition(opcode)
         else:
             assert npc_result.error is None
-            assert len(npc_result.npc_list) == 1
-            assert npc_result.npc_list[0].conditions == [
-                (
-                    opcode,
-                    [ConditionWithArgs(opcode, [int_to_bytes(28)])],
-                )
-            ]
+            assert len(npc_result.conds.spends) == 1
+            if opcode == ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE:
+                assert npc_result.conds.height_absolute == 28
+            elif opcode == ConditionOpcode.ASSERT_HEIGHT_RELATIVE:
+                assert npc_result.conds.spends[0].height_relative == 28
+            elif opcode == ConditionOpcode.ASSERT_SECONDS_ABSOLUTE:
+                assert npc_result.conds.seconds_absolute == 28
+            elif opcode == ConditionOpcode.ASSERT_SECONDS_RELATIVE:
+                assert npc_result.conds.spends[0].seconds_relative == 28
+
         print(f"run time:{run_time}")
         assert run_time < 0.7
 
@@ -2222,13 +2190,17 @@ class TestMaliciousGenerators:
             assert npc_result.error == error_for_condition(opcode)
         else:
             assert npc_result.error is None
-            assert len(npc_result.npc_list) == 1
-            assert npc_result.npc_list[0].conditions == [
-                (
-                    opcode,
-                    [ConditionWithArgs(opcode, [bytes([100])])],
-                )
-            ]
+            assert len(npc_result.conds.spends) == 1
+
+            if opcode == ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE:
+                assert npc_result.conds.height_absolute == 100
+            elif opcode == ConditionOpcode.ASSERT_HEIGHT_RELATIVE:
+                assert npc_result.conds.spends[0].height_relative == 100
+            elif opcode == ConditionOpcode.ASSERT_SECONDS_ABSOLUTE:
+                assert npc_result.conds.seconds_absolute == 100
+            elif opcode == ConditionOpcode.ASSERT_SECONDS_RELATIVE:
+                assert npc_result.conds.spends[0].seconds_relative == 100
+
         print(f"run time:{run_time}")
         assert run_time < 1.1
 
@@ -2251,13 +2223,17 @@ class TestMaliciousGenerators:
             assert npc_result.error == error_for_condition(opcode)
         else:
             assert npc_result.error is None
-            assert len(npc_result.npc_list) == 1
-            assert npc_result.npc_list[0].conditions == [
-                (
-                    opcode,
-                    [ConditionWithArgs(opcode, [bytes([100])])],
-                )
-            ]
+            assert len(npc_result.conds.spends) == 1
+
+            if opcode == ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE:
+                assert npc_result.conds.height_absolute == 100
+            elif opcode == ConditionOpcode.ASSERT_HEIGHT_RELATIVE:
+                assert npc_result.conds.spends[0].height_relative == 100
+            elif opcode == ConditionOpcode.ASSERT_SECONDS_ABSOLUTE:
+                assert npc_result.conds.seconds_absolute == 100
+            elif opcode == ConditionOpcode.ASSERT_SECONDS_RELATIVE:
+                assert npc_result.conds.spends[0].seconds_relative == 100
+
         print(f"run time:{run_time}")
         assert run_time < 1.1
 
@@ -2282,10 +2258,17 @@ class TestMaliciousGenerators:
             assert npc_result.error == error_for_condition(opcode)
         else:
             assert npc_result.error is None
-            assert len(npc_result.npc_list) == 1
+            assert len(npc_result.conds.spends) == 1
 
-            print(npc_result.npc_list[0].conditions[0][1])
-            assert ConditionWithArgs(opcode, [int_to_bytes(0xFFFFFFFF)]) in npc_result.npc_list[0].conditions[0][1]
+            if opcode == ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE:
+                assert npc_result.conds.height_absolute == 0xFFFFFFFF
+            elif opcode == ConditionOpcode.ASSERT_HEIGHT_RELATIVE:
+                assert npc_result.conds.spends[0].height_relative == 0xFFFFFFFF
+            elif opcode == ConditionOpcode.ASSERT_SECONDS_ABSOLUTE:
+                assert npc_result.conds.seconds_absolute == 0xFFFFFFFF
+            elif opcode == ConditionOpcode.ASSERT_SECONDS_RELATIVE:
+                assert npc_result.conds.spends[0].seconds_relative == 0xFFFFFFFF
+
         print(f"run time:{run_time}")
         assert run_time < 0.3
 
@@ -2305,8 +2288,7 @@ class TestMaliciousGenerators:
         npc_result = generator_condition_tester(condition, quote=False, height=softfork_height)
         run_time = time() - start_time
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 1
-        assert npc_result.npc_list[0].conditions == []
+        assert len(npc_result.conds.spends) == 1
         print(f"run time:{run_time}")
         assert run_time < 1
 
@@ -2321,13 +2303,9 @@ class TestMaliciousGenerators:
             assert npc_result.error == error_for_condition(opcode)
         else:
             assert npc_result.error is None
-            assert len(npc_result.npc_list) == 1
-            assert npc_result.npc_list[0].conditions == [
-                (
-                    opcode.value,
-                    [ConditionWithArgs(opcode, [int_to_bytes(100 * 280000)])],
-                )
-            ]
+            assert len(npc_result.conds.spends) == 1
+            assert npc_result.conds.reserve_fee == 100 * 280000
+
         print(f"run time:{run_time}")
         assert run_time < 1
 
@@ -2341,7 +2319,7 @@ class TestMaliciousGenerators:
         # RESERVE_FEE conditions fail unconditionally if they have a negative
         # amount
         assert npc_result.error == Err.RESERVE_FEE_CONDITION_FAILED.value
-        assert len(npc_result.npc_list) == 0
+        assert npc_result.conds is None
         print(f"run time:{run_time}")
         assert run_time < 0.8
 
@@ -2355,9 +2333,8 @@ class TestMaliciousGenerators:
         npc_result = generator_condition_tester(condition, quote=False, height=softfork_height)
         run_time = time() - start_time
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 1
+        assert len(npc_result.conds.spends) == 1
         # coin announcements are not propagated to python, but validated in rust
-        assert len(npc_result.npc_list[0].conditions) == 0
         # TODO: optimize clvm to make this run in < 1 second
         print(f"run time:{run_time}")
         assert run_time < 7
@@ -2373,7 +2350,7 @@ class TestMaliciousGenerators:
         npc_result = generator_condition_tester(condition, quote=False, height=softfork_height)
         run_time = time() - start_time
         assert npc_result.error == Err.DUPLICATE_OUTPUT.value
-        assert len(npc_result.npc_list) == 0
+        assert npc_result.conds is None
         print(f"run time:{run_time}")
         assert run_time < 0.8
 
@@ -2388,10 +2365,9 @@ class TestMaliciousGenerators:
         npc_result = generator_condition_tester(condition, quote=False, height=softfork_height)
         run_time = time() - start_time
         assert npc_result.error is None
-        assert len(npc_result.npc_list) == 1
-        assert len(npc_result.npc_list[0].conditions) == 1
-        assert npc_result.npc_list[0].conditions[0][0] == ConditionOpcode.CREATE_COIN.value
-        assert len(npc_result.npc_list[0].conditions[0][1]) == 6094
+        assert len(npc_result.conds.spends) == 1
+        spend = npc_result.conds.spends[0]
+        assert len(spend.create_coin) == 6094
         print(f"run time:{run_time}")
         assert run_time < 0.2
 
@@ -2435,65 +2411,37 @@ class TestPkmPairs:
     ASU = ConditionOpcode.AGG_SIG_UNSAFE
 
     def test_empty_list(self):
-        npc_list = []
-        pks, msgs = pkm_pairs(npc_list, b"foobar")
+        conds = SpendBundleConditions([], 0, 0, 0, [], 0)
+        pks, msgs = pkm_pairs(conds, b"foobar")
         assert pks == []
         assert msgs == []
 
     def test_no_agg_sigs(self):
-        npc_list = [
-            NPC(self.h1, self.h2, [(self.CCA, [ConditionWithArgs(self.CCA, [b"msg"])])]),
-            NPC(self.h3, self.h4, [(self.CC, [ConditionWithArgs(self.CCA, [self.h1, bytes([1])])])]),
-        ]
-        pks, msgs = pkm_pairs(npc_list, b"foobar")
+        # one create coin: h1 amount: 1 and not hint
+        spends = [Spend(self.h3, self.h4, None, 0, [(self.h1, 1, b"")], [])]
+        conds = SpendBundleConditions(spends, 0, 0, 0, [], 0)
+        pks, msgs = pkm_pairs(conds, b"foobar")
         assert pks == []
         assert msgs == []
 
     def test_agg_sig_me(self):
-        npc_list = [
-            NPC(
-                self.h1,
-                self.h2,
-                [
-                    (
-                        self.ASM,
-                        [
-                            ConditionWithArgs(self.ASM, [bytes(self.pk1), b"msg1"]),
-                            ConditionWithArgs(self.ASM, [bytes(self.pk2), b"msg2"]),
-                        ],
-                    )
-                ],
-            )
-        ]
-        pks, msgs = pkm_pairs(npc_list, b"foobar")
+
+        spends = [Spend(self.h1, self.h2, None, 0, [], [(bytes48(self.pk1), b"msg1"), (bytes48(self.pk2), b"msg2")])]
+        conds = SpendBundleConditions(spends, 0, 0, 0, [], 0)
+        pks, msgs = pkm_pairs(conds, b"foobar")
         assert [bytes(pk) for pk in pks] == [bytes(self.pk1), bytes(self.pk2)]
         assert msgs == [b"msg1" + self.h1 + b"foobar", b"msg2" + self.h1 + b"foobar"]
 
     def test_agg_sig_unsafe(self):
-        npc_list = [
-            NPC(
-                self.h1,
-                self.h2,
-                [
-                    (
-                        self.ASU,
-                        [
-                            ConditionWithArgs(self.ASU, [bytes(self.pk1), b"msg1"]),
-                            ConditionWithArgs(self.ASU, [bytes(self.pk2), b"msg2"]),
-                        ],
-                    )
-                ],
-            )
-        ]
-        pks, msgs = pkm_pairs(npc_list, b"foobar")
+        conds = SpendBundleConditions([], 0, 0, 0, [(bytes48(self.pk1), b"msg1"), (bytes48(self.pk2), b"msg2")], 0)
+        pks, msgs = pkm_pairs(conds, b"foobar")
         assert [bytes(pk) for pk in pks] == [bytes(self.pk1), bytes(self.pk2)]
         assert msgs == [b"msg1", b"msg2"]
 
     def test_agg_sig_mixed(self):
-        npc_list = [
-            NPC(self.h1, self.h2, [(self.ASM, [ConditionWithArgs(self.ASM, [bytes(self.pk1), b"msg1"])])]),
-            NPC(self.h1, self.h2, [(self.ASU, [ConditionWithArgs(self.ASU, [bytes(self.pk2), b"msg2"])])]),
-        ]
-        pks, msgs = pkm_pairs(npc_list, b"foobar")
-        assert [bytes(pk) for pk in pks] == [bytes(self.pk1), bytes(self.pk2)]
-        assert msgs == [b"msg1" + self.h1 + b"foobar", b"msg2"]
+
+        spends = [Spend(self.h1, self.h2, None, 0, [], [(bytes48(self.pk1), b"msg1")])]
+        conds = SpendBundleConditions(spends, 0, 0, 0, [(bytes48(self.pk2), b"msg2")], 0)
+        pks, msgs = pkm_pairs(conds, b"foobar")
+        assert [bytes(pk) for pk in pks] == [bytes(self.pk2), bytes(self.pk1)]
+        assert msgs == [b"msg2", b"msg1" + self.h1 + b"foobar"]
