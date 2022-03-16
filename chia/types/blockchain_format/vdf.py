@@ -118,15 +118,36 @@ def compress_output(
     output: ClassgroupElement,
     proof: VDFProof,
     number_of_iterations: uint64,
+    executor: ProcessPoolExecutor,
 ):
-    res = get_b_from_n_wesolowski(
+    future = executor.submit(
+        compress_future,
         str(get_discriminant(challenge, disc_size)),
-        input.data,
-        output.data + proof.witness,
+        bytes(output.data),
+        bytes(input.data),
+        bytes(proof.witness),
         number_of_iterations,
         proof.witness_type,
     )
-    return CompressedClassgroupElement.from_hex(res)
+
+    return future
+
+
+def compress_future(
+    disc: str,
+    output: bytes,
+    input: bytes,
+    proof: bytes,
+    number_of_iterations: uint64,
+    proof_type: int,
+):
+    return get_b_from_n_wesolowski(
+        disc,
+        input,
+        output + proof,
+        number_of_iterations,
+        proof_type,
+    )
 
 
 def verify_compressed_vdf(
@@ -143,29 +164,26 @@ def verify_compressed_vdf(
         return None
     res = executor.submit(
         verify_compressed_future,
-        constants.DISCRIMINANT_SIZE_BITS,
-        bytes(challenge),
-        bytes(vdf_input.data),
+        str(get_discriminant(challenge, constants.DISCRIMINANT_SIZE_BITS)),
         f"0x{vdf_output.data.hex()}",
+        bytes(vdf_input.data),
         bytes(proof.witness),
-        proof.witness_type,
         number_of_iterations,
+        proof.witness_type,
     )
     return res
 
 
 def verify_compressed_future(
-    disc_size: int,
-    challenge: bytes,
-    input: bytes,
+    disc: str,
     output: str,
+    input: bytes,
     proof: bytes,
-    proof_type: int,
     number_of_iterations: uint64,
+    proof_type: int,
 ):
-    disc: int = get_discriminant(challenge, disc_size)
     return verify_n_wesolowski_with_b(
-        str(disc),
+        disc,
         output,
         input,
         proof,
@@ -197,3 +215,9 @@ def get_vdf_result(future):
         raise Exception("vdf future was None")
     x, y = future.result()
     return x, ClassgroupElement.from_bytes(y)
+
+
+def get_compress_result(future):
+    if future is None:
+        raise Exception("compress future was None")
+    return CompressedClassgroupElement.from_hex(future.result())

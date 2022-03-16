@@ -29,6 +29,7 @@ from chia.types.blockchain_format.vdf import (
     get_vdf_result,
     verify_compressed_vdf,
     is_valid,
+    get_compress_result,
 )
 from chia.types.end_of_slot_bundle import EndOfSubSlotBundle
 from chia.types.header_block import HeaderBlock
@@ -204,7 +205,7 @@ class WeightProofHandlerV2:
         rng = random.Random(seed)
         last_ses_block, prev_prev_ses_block = await self.get_last_l_weight(summary_heights, tip_rec.height)
         if last_ses_block is None or prev_prev_ses_block is None:
-            log.error("failed getting last L")
+            log.error("failed getting chain last L")
             return None
         last_l_weight = last_ses_block.weight - prev_prev_ses_block.weight
         log.debug(f"total weight {last_ses_block.weight} prev weight {prev_prev_ses_block.weight}")
@@ -397,7 +398,7 @@ class WeightProofHandlerV2:
             while curr.height < ses_block.height:
                 if blocks[curr.header_hash].is_challenge_block(self.constants):
                     log.debug(f"challenge segment {idx}, starts at {curr.height} ")
-                    seg, height = await self._create_challenge_segment(
+                    seg, height = self._create_challenge_segment(
                         curr, sub_epoch_n, header_blocks, blocks, first, executor
                     )
                     if seg is None:
@@ -414,7 +415,7 @@ class WeightProofHandlerV2:
         log.debug(f"next sub epoch starts at {height}")
         return segments
 
-    async def _create_challenge_segment(
+    def _create_challenge_segment(
         self,
         header_block: HeaderBlock,
         sub_epoch_n: uint32,
@@ -426,8 +427,7 @@ class WeightProofHandlerV2:
         sub_slots: List[SubSlotDataV2] = []
         log.debug(f"create challenge segment block {header_block.header_hash} block height {header_block.height} ")
         # VDFs from sub slots before challenge block
-        slot_end_task = self.__slot_end_vdf(uint32(header_block.height + 1), header_blocks, blocks, executor)
-        first_sub_slots, end_of_sub_slot_bundle = await self.__first_sub_slot_vdfs(
+        first_sub_slots, end_of_sub_slot_bundle = self.__first_sub_slot_vdfs(
             header_block, header_blocks, blocks, first_segment_in_sub_epoch, executor
         )
         if first_sub_slots is None:
@@ -438,9 +438,11 @@ class WeightProofHandlerV2:
         sub_slots.append(handle_block_vdfs(executor, self.constants, header_block, blocks))
 
         # # VDFs from slot after challenge block to end of slot
-        log.debug(f"create slot end vdf for block {header_block.header_hash} height {header_block.height} ")
+        log.debug(f"create slot end vdf for block {header_block.header_hash} height {header_block.height}")
+        challenge_slot_end_sub_slots, end_height = self.__slot_end_vdf(
+            uint32(header_block.height + 1), header_blocks, blocks, executor
+        )
 
-        challenge_slot_end_sub_slots, end_height = await slot_end_task
         if challenge_slot_end_sub_slots is None:
             log.error("failed building slot end ")
             return None, uint32(0)
@@ -481,7 +483,7 @@ class WeightProofHandlerV2:
         return SubEpochChallengeSegmentV2(sub_epoch_n, sub_slots, None, None, None, None), end_height
 
     # returns a challenge chain vdf from slot start to signage point
-    async def __first_sub_slot_vdfs(
+    def __first_sub_slot_vdfs(
         self,
         header_block: HeaderBlock,
         header_blocks: Dict[bytes32, HeaderBlock],
@@ -539,7 +541,7 @@ class WeightProofHandlerV2:
             curr = blocks[curr.prev_hash]
         return header_blocks[curr.header_hash].finished_sub_slots[-1].reward_chain.end_of_slot_vdf
 
-    async def __slot_end_vdf(
+    def __slot_end_vdf(
         self,
         start_height: uint32,
         header_blocks: Dict[bytes32, HeaderBlock],
@@ -640,6 +642,7 @@ def handle_block_vdfs(
             header_block.reward_chain_block.challenge_chain_sp_vdf.output,
             header_block.challenge_chain_sp_proof,
             sp_iters,
+            executor,
         )
     cc_ip_input = ClassgroupElement.get_default_element()
     cc_ip_iters = block_rec.ip_iters(constants)
@@ -656,6 +659,7 @@ def handle_block_vdfs(
         header_block.reward_chain_block.challenge_chain_ip_vdf.output,
         header_block.challenge_chain_ip_proof,
         cc_ip_iters,
+        executor,
     )
     compressed_icc_ip_output = None
     if header_block.infused_challenge_chain_ip_proof is not None:
@@ -675,18 +679,20 @@ def handle_block_vdfs(
             header_block.reward_chain_block.infused_challenge_chain_ip_vdf.output,
             header_block.infused_challenge_chain_ip_proof,
             icc_ip_iters,
+            executor,
         )
+
     return SubSlotDataV2(
         header_block.reward_chain_block.proof_of_space if block_rec.is_challenge_block(constants) else None,
         header_block.challenge_chain_sp_proof,
         header_block.challenge_chain_ip_proof,
         header_block.reward_chain_block.signage_point_index,
         None,
-        compressed_sp_output,
-        compressed_cc_ip_output,
+        None if compressed_sp_output is None else get_compress_result(compressed_sp_output),
+        get_compress_result(compressed_cc_ip_output),
         None,
         header_block.infused_challenge_chain_ip_proof,
-        compressed_icc_ip_output,
+        None if compressed_icc_ip_output is None else get_compress_result(compressed_icc_ip_output),
         None,
         None,
         header_block.reward_chain_block.challenge_chain_sp_signature
@@ -1647,6 +1653,3 @@ def map_segments_by_sub_epoch(
             segments[curr_sub_epoch_n] = []
         segments[curr_sub_epoch_n].append(segment)
     return segments
-
-
-
