@@ -44,7 +44,7 @@ from chia.types.weight_proof import (
 from chia.util.block_cache import BlockCache
 from chia.util.hash import std_hash
 from chia.util.ints import uint8, uint32, uint64, uint128
-from chia.util.streamable import dataclass_from_dict, recurse_jsonify
+from chia.util.streamable import recurse_jsonify
 
 log = logging.getLogger(__name__)
 
@@ -84,32 +84,6 @@ class WeightProofHandlerV2:
             self.proof = wp
             self.tip = tip
             return wp
-
-    def validate_weight_proof_single_proc(self, weight_proof: WeightProofV2, seed: bytes32) -> Tuple[bool, uint32]:
-        if len(weight_proof.sub_epochs) == 0:
-            return False, uint32(0)
-
-        peak_height = weight_proof.recent_chain_data[-1].reward_chain_block.height
-        log.info(f"validate weight proof peak height {peak_height}")
-        summaries, sub_epoch_weight_list = _validate_sub_epoch_summaries(self.constants, weight_proof)
-        if summaries is None or sub_epoch_weight_list is None:
-            log.warning("weight proof failed sub epoch data validation")
-            return False, uint32(0)
-        constants, summary_bytes, wp_segment_bytes, wp_recent_chain_bytes = vars_to_bytes(
-            self.constants, summaries, weight_proof
-        )
-        log.info("validate sub epoch challenge segments")
-        rng = random.Random(seed)
-        if not validate_sub_epoch_sampling(rng, sub_epoch_weight_list, weight_proof):
-            log.error("failed weight proof sub epoch sample validation")
-            return False, uint32(0)
-        with ProcessPoolExecutor() as executor:
-            if not _validate_sub_epoch_segments(constants, rng, wp_segment_bytes, summary_bytes, executor):
-                return False, uint32(0)
-        log.info("validate weight proof recent blocks")
-        if not _validate_recent_blocks(constants, wp_recent_chain_bytes, summary_bytes):
-            return False, uint32(0)
-        return True, self.get_fork_point(summaries)
 
     def get_fork_point_no_validations(self, weight_proof: WeightProofV2) -> Tuple[bool, uint32]:
         log.debug("get fork point skip validations")
@@ -846,7 +820,7 @@ def _validate_sub_epoch_segments(
     weight_proof_bytes: bytes,
     summaries_bytes: List[bytes],
     executor: ProcessPoolExecutor,
-):
+) -> bool:
     constants, summaries = bytes_to_vars(constants_dict, summaries_bytes)
     sub_epoch_segments: SubEpochSegmentsV2 = SubEpochSegmentsV2.from_bytes(weight_proof_bytes)
     total_blocks, total_ip_iters = 0, 0
@@ -1308,34 +1282,16 @@ def _validate_sub_slot_data(
     sp_res_future = None
     sub_slot_data = sub_slots[sub_slot_idx]
     prev_ssd = sub_slots[sub_slot_idx - 1]
-    # find end of slot
-    idx = sub_slot_idx
-    while idx < len(sub_slots) - 1:
-        curr_slot = sub_slots[idx]
-        if curr_slot.is_end_of_slot():
-            # dont validate intermediate vdfs if slot is blue boxed
-            assert curr_slot.cc_slot_end
-            assert curr_slot.icc_slot_end
-            if (
-                curr_slot.cc_slot_end.normalized_to_identity is True
-                and curr_slot.icc_slot_end.normalized_to_identity is True
-            ):
-                log.debug(f"skip intermediate vdfs slot {sub_slot_idx}")
-                return True
-            else:
-                break
-        idx += 1
-    assert sub_slot_data.signage_point_index is not None
-
+    # find next end of slot
     if sub_slot_data.cc_signage_point:
-        is_overflow = is_overflow_block(constants, sub_slot_data.signage_point_index)
-        assert sub_slot_data.cc_sp_vdf_output
+        assert sub_slot_data.cc_sp_vdf_output is not None
         sp_iters = calculate_sp_iters(constants, ssi, sub_slot_data.signage_point_index)
-        icc_ip_input = ClassgroupElement.get_default_element()
+        cc_sp_input = ClassgroupElement.get_default_element()
         iterations = sp_iters
         challenge = cc_challenge
+        is_overflow = is_overflow_block(constants, sub_slot_data.signage_point_index)
         if is_overflow:
-            assert prev_cc_sub_slot_hash
+            assert prev_cc_sub_slot_hash is not None
             challenge = prev_cc_sub_slot_hash
         if not sub_slot_data.cc_signage_point.normalized_to_identity:
             sp_total_iters = get_sp_total_iters(sp_iters, is_overflow, ssi, sub_slot_data)
@@ -1343,28 +1299,28 @@ def _validate_sub_slot_data(
                 sub_slot_idx, sub_slots, is_overflow, sp_total_iters, sp_iters
             )
             if isinstance(tmp_input, CompressedClassgroupElement):
-                icc_ip_input = long_outputs[tmp_input]
+                cc_sp_input = long_outputs[tmp_input]
             elif isinstance(tmp_input, ClassgroupElement):
-                icc_ip_input = tmp_input
+                cc_sp_input = tmp_input
         sp_res_future = verify_compressed_vdf(
             executor,
             constants,
             challenge,
-            icc_ip_input,
+            cc_sp_input,
             sub_slot_data.cc_sp_vdf_output,
             sub_slot_data.cc_signage_point,
             iterations,
         )
     cc_ip_input = ClassgroupElement.get_default_element()
     ip_vdf_iters = sub_slot_data.ip_iters
-    assert sub_slot_data.cc_infusion_point
+    assert sub_slot_data.cc_infusion_point is not None
     if not prev_ssd.is_end_of_slot() and not sub_slot_data.cc_infusion_point.normalized_to_identity:
         assert prev_ssd.cc_ip_vdf_output
         assert sub_slot_data.total_iters
         assert prev_ssd.total_iters
         cc_ip_input = long_outputs[prev_ssd.cc_ip_vdf_output]
         ip_vdf_iters = uint64(sub_slot_data.total_iters - prev_ssd.total_iters)
-    assert sub_slot_data.cc_ip_vdf_output
+    assert sub_slot_data.cc_ip_vdf_output is not None
     assert ip_vdf_iters is not None
     ip_future = verify_compressed_vdf(
         executor,
@@ -1423,6 +1379,44 @@ def _validate_sub_slot_data(
         long_outputs[sub_slot_data.icc_ip_vdf_output] = icc_ip_output
 
     return True
+
+
+def normalized_can_skip(constants, sub_slot_data, sub_slot_idx, sub_slots):
+    idx = sub_slot_idx
+    while idx < len(sub_slots) - 1:
+        curr_slot = sub_slots[idx]
+        if curr_slot.is_end_of_slot():
+            # dont validate intermediate vdfs if slot is blue boxed
+            assert curr_slot.cc_slot_end
+            assert curr_slot.icc_slot_end
+            if (
+                curr_slot.cc_slot_end.normalized_to_identity is True
+                and curr_slot.icc_slot_end.normalized_to_identity is True
+            ):
+                log.debug(f"skip intermediate vdfs slot {sub_slot_idx}")
+                return True
+            else:
+                break
+        idx += 1
+    assert sub_slot_data.signage_point_index is not None
+    if is_overflow_block(constants, sub_slot_data.signage_point_index):
+        idx = sub_slot_idx
+        while idx > 0:
+            curr_slot = sub_slots[idx]
+            if curr_slot.is_end_of_slot():
+                # dont validate intermediate vdfs if slot is blue boxed
+                assert curr_slot.cc_slot_end
+                assert curr_slot.icc_slot_end
+                if (
+                    curr_slot.cc_slot_end.normalized_to_identity is True
+                    and curr_slot.icc_slot_end.normalized_to_identity is True
+                ):
+                    log.debug(f"skip intermediate vdfs slot {sub_slot_idx}")
+                    return True
+                else:
+                    break
+            idx -= 1
+    return False
 
 
 def sub_slot_data_vdf_info(
