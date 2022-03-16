@@ -1,4 +1,3 @@
-
 import logging
 from typing import Dict, List, Optional
 
@@ -17,6 +16,7 @@ from chia.util.block_cache import BlockCache
 from chia.util.ints import uint8, uint64, uint128, uint32
 from chia.util.streamable import dataclass_from_dict
 from chia.types.end_of_slot_bundle import EndOfSubSlotBundle
+
 log = logging.getLogger(__name__)
 
 
@@ -131,6 +131,7 @@ def _validate_recent_blocks(constants_dict: Dict, recent_chain_bytes: bytes, sum
 
     return True
 
+
 def _validate_pospace_recent_chain(
     constants: ConsensusConstants,
     block: HeaderBlock,
@@ -161,7 +162,6 @@ def _validate_pospace_recent_chain(
         cc_sp_hash,
     )
     return required_iters
-
 
 
 def bytes_to_vars(constants_dict, summaries_bytes):
@@ -197,7 +197,6 @@ def get_deficit(
     return calculate_deficit(constants, uint32(prev_block.height + 1), prev_block, overflow, num_finished_sub_slots)
 
 
-
 def _validate_summaries_weight(constants: ConsensusConstants, sub_epoch_data_weight, summaries, weight_proof) -> bool:
     num_over = summaries[-1].num_blocks_overflow
     ses_end_height = (len(summaries) - 1) * constants.SUB_EPOCH_BLOCKS + num_over - 1
@@ -210,7 +209,8 @@ def _validate_summaries_weight(constants: ConsensusConstants, sub_epoch_data_wei
 
     return curr.reward_chain_block.weight == sub_epoch_data_weight
 
-async def get_prev_two_slots_height(blockchain:BlockchainInterface, se_start: BlockRecord) -> uint32:
+
+async def get_prev_two_slots_height(blockchain: BlockchainInterface, se_start: BlockRecord) -> uint32:
     # find prev 2 slots height
     slot = 0
     batch_size = 50
@@ -223,5 +223,5 @@ async def get_prev_two_slots_height(blockchain:BlockchainInterface, se_start: Bl
         if end - curr_rec.height == batch_size - 1:
             blocks = await blockchain.get_block_records_in_range(curr_rec.height - batch_size, curr_rec.height)
             end = curr_rec.height
-        curr_rec = blocks[blockchain.height_to_hash(uint32(curr_rec.height - 1))]  # type: ignore[index]
+        curr_rec = blocks[blockchain.height_to_hash(uint32(curr_rec.height - 1))]
     return curr_rec.height

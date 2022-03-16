@@ -15,8 +15,14 @@ from chia.consensus.pot_iterations import (
     is_overflow_block,
 )
 from chia.consensus.vdf_info_computation import get_signage_point_vdf_info
-from chia.full_node.weight_proof_common import blue_boxed_end_of_slot, _validate_recent_blocks, \
-    _validate_summaries_weight, bytes_to_vars, _sample_sub_epoch, get_prev_two_slots_height
+from chia.full_node.weight_proof_common import (
+    blue_boxed_end_of_slot,
+    _validate_recent_blocks,
+    _validate_summaries_weight,
+    bytes_to_vars,
+    _sample_sub_epoch,
+    get_prev_two_slots_height,
+)
 from chia.types.blockchain_format.classgroup import ClassgroupElement
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.blockchain_format.slots import ChallengeChainSubSlot, RewardChainSubSlot
@@ -1116,8 +1122,6 @@ def sub_slot_data_vdf_input(
     return cc_input
 
 
-
-
 def __validate_pospace(
     constants: ConsensusConstants,
     segment: SubEpochChallengeSegment,
@@ -1312,7 +1316,6 @@ def _get_last_ses_hash(
     return None, uint32(0)
 
 
-
 def get_sp_total_iters(constants: ConsensusConstants, is_overflow: bool, ssi: uint64, sub_slot_data: SubSlotData):
     assert sub_slot_data.cc_ip_vdf_info is not None
     assert sub_slot_data.total_iters is not None
@@ -1354,33 +1357,3 @@ def map_segments_by_sub_epoch(sub_epoch_segments) -> Dict[int, List[SubEpochChal
             segments[curr_sub_epoch_n] = []
         segments[curr_sub_epoch_n].append(segment)
     return segments
-
-
-def validate_total_iters(
-    segment: SubEpochChallengeSegment,
-    sub_slot_data_idx,
-    expected_sub_slot_iters: uint64,
-    finished_sub_slots_since_prev: int,
-    prev_b: SubSlotData,
-    prev_sub_slot_data_iters,
-    genesis,
-) -> bool:
-    sub_slot_data = segment.sub_slots[sub_slot_data_idx]
-    if genesis:
-        total_iters: uint128 = uint128(expected_sub_slot_iters * finished_sub_slots_since_prev)
-    elif segment.sub_slots[sub_slot_data_idx - 1].is_end_of_slot():
-        assert prev_b.total_iters
-        assert prev_b.cc_ip_vdf_info
-        total_iters = prev_b.total_iters
-        # Add the rest of the slot of prev_b
-        total_iters = uint128(total_iters + prev_sub_slot_data_iters - prev_b.cc_ip_vdf_info.number_of_iterations)
-        # Add other empty slots
-        total_iters = uint128(total_iters + (expected_sub_slot_iters * (finished_sub_slots_since_prev - 1)))
-    else:
-        # Slot iters is guaranteed to be the same for header_block and prev_b
-        # This takes the beginning of the slot, and adds ip_iters
-        assert prev_b.cc_ip_vdf_info
-        assert prev_b.total_iters
-        total_iters = uint128(prev_b.total_iters - prev_b.cc_ip_vdf_info.number_of_iterations)
-    total_iters = uint128(total_iters + sub_slot_data.cc_ip_vdf_info.number_of_iterations)
-    return total_iters == sub_slot_data.total_iters

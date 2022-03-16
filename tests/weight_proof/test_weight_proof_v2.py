@@ -1,5 +1,6 @@
 # flake8: noqa: F811, F401
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -152,7 +153,8 @@ async def _test_map_summaries(blocks, header_cache, height_to_hash, sub_blocks, 
     )
     assert len(summaries) == len(orig_summaries)
 
-seed = b"asdfghjkl"
+
+seed = bytes32.from_bytes(os.urandom(32))
 
 
 class TestWeightProof:
@@ -401,8 +403,6 @@ class TestWeightProof:
             normalized_to_identity_cc_eos=True,
             normalized_to_identity_icc_eos=True,
         )
-
-
 
         header_cache, height_to_hash, sub_blocks, summaries = await load_blocks_dont_validate(blocks)
         wpf = WeightProofHandlerV2(test_constants, BlockCache(sub_blocks, header_cache, height_to_hash, summaries))

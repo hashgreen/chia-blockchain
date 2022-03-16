@@ -11,8 +11,14 @@ from chia.consensus.blockchain_interface import BlockchainInterface
 from chia.consensus.constants import ConsensusConstants
 from chia.consensus.pot_iterations import calculate_iterations_quality, calculate_sp_iters, is_overflow_block
 from chia.consensus.vdf_info_computation import get_signage_point_vdf_info
-from chia.full_node.weight_proof_common import _validate_recent_blocks, _validate_summaries_weight, \
-    blue_boxed_end_of_slot, bytes_to_vars, _sample_sub_epoch, get_prev_two_slots_height
+from chia.full_node.weight_proof_common import (
+    _validate_recent_blocks,
+    _validate_summaries_weight,
+    blue_boxed_end_of_slot,
+    bytes_to_vars,
+    _sample_sub_epoch,
+    get_prev_two_slots_height,
+)
 from chia.types.blockchain_format.classgroup import ClassgroupElement, CompressedClassgroupElement
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.blockchain_format.slots import ChallengeChainSubSlot, RewardChainSubSlot, ChallengeBlockInfo
@@ -59,7 +65,7 @@ class WeightProofHandlerV2:
         self.blockchain = blockchain
         self.lock = asyncio.Lock()
 
-    async def get_proof_of_weight(self, tip: bytes32, seed:bytes32) -> Optional[WeightProofV2]:
+    async def get_proof_of_weight(self, tip: bytes32, seed: bytes32) -> Optional[WeightProofV2]:
 
         tip_rec = self.blockchain.try_block_record(tip)
         if tip_rec is None:
@@ -78,7 +84,7 @@ class WeightProofHandlerV2:
             self.tip = tip
             return wp
 
-    def validate_weight_proof_single_proc(self, weight_proof: WeightProofV2, seed:bytes32) -> Tuple[bool, uint32]:
+    def validate_weight_proof_single_proc(self, weight_proof: WeightProofV2, seed: bytes32) -> Tuple[bool, uint32]:
         if len(weight_proof.sub_epochs) == 0:
             return False, uint32(0)
 
@@ -114,7 +120,9 @@ class WeightProofHandlerV2:
             return False, uint32(0)
         return True, self.get_fork_point(summaries)
 
-    async def validate_weight_proof(self, weight_proof: WeightProofV2, seed: bytes32) -> Tuple[bool, uint32, List[SubEpochSummary]]:
+    async def validate_weight_proof(
+        self, weight_proof: WeightProofV2, seed: bytes32
+    ) -> Tuple[bool, uint32, List[SubEpochSummary]]:
         if len(weight_proof.sub_epochs) == 0:
             return False, uint32(0), []
 
@@ -122,7 +130,7 @@ class WeightProofHandlerV2:
         log.info(f"validate weight proof peak height {peak_height}")
 
         summaries, sub_epoch_weight_list = _validate_sub_epoch_summaries(self.constants, weight_proof)
-        if summaries is None:
+        if summaries is None or sub_epoch_weight_list is None:
             log.error("weight proof failed sub epoch data validation")
             return False, uint32(0), []
         rng = random.Random(seed)
@@ -179,7 +187,7 @@ class WeightProofHandlerV2:
             sub_epoch_data.append(_create_sub_epoch_data(ses))
         return sub_epoch_data
 
-    async def _create_proof_of_weight(self, tip: bytes32, seed:bytes32) -> Optional[WeightProofV2]:
+    async def _create_proof_of_weight(self, tip: bytes32, seed: bytes32) -> Optional[WeightProofV2]:
         """
         Creates a weight proof object
         """
@@ -196,19 +204,26 @@ class WeightProofHandlerV2:
         rng = random.Random(seed)
         last_ses_block, prev_prev_ses_block = await self.get_last_l_weight(summary_heights, tip_rec.height)
         if last_ses_block is None or prev_prev_ses_block is None:
+            log.error("failed getting last L")
             return None
         last_l_weight = last_ses_block.weight - prev_prev_ses_block.weight
         log.debug(f"total weight {last_ses_block.weight} prev weight {prev_prev_ses_block.weight}")
         weight_to_check = _get_weights_for_sampling(rng, last_ses_block.weight, last_l_weight)
-        sample_n = 0
+        if weight_to_check is None:
+            log.error("failed getting weight list for samples")
+            return None
+
         ses_blocks = await self.blockchain.get_block_records_at(summary_heights)
         if ses_blocks is None:
+            log.error("failed pulling ses blocks from database")
             return None
 
         # set prev_ses to genesis
         prev_ses_block = await self.blockchain.get_block_record_from_db(self.blockchain.height_to_hash(uint32(0)))
         if prev_ses_block is None:
             return None
+
+        sample_n = 0
         for sub_epoch_n, ses_height in enumerate(summary_heights):
             if ses_height > tip_rec.height:
                 break
@@ -224,7 +239,7 @@ class WeightProofHandlerV2:
                 log.error("error while building proof")
                 return None
 
-            if _sample_sub_epoch(prev_ses_block.weight, ses_block.weight, weight_to_check):  # type: ignore
+            if _sample_sub_epoch(prev_ses_block.weight, ses_block.weight, weight_to_check):
                 sample_n += 1
                 segments = await self.blockchain.get_sub_epoch_challenge_segments_v2(ses_block.header_hash)
                 if segments is None:
@@ -901,7 +916,7 @@ def _validate_segment(
     ses: Optional[SubEpochSummary],
     sampled: bool,
     cc_challenge: bytes32,
-    icc_challenge: bytes32,
+    icc_challenge: Optional[bytes32],
     prev_challenge_ip_iters: uint64,
     executor: ProcessPoolExecutor,
 ) -> Optional[Tuple[uint64, uint64, int, bytes32, bytes32, bool]]:
@@ -945,6 +960,7 @@ def _validate_segment(
             after_challenge_block = True
         elif sampled and after_challenge_block:
             # all vdfs from challenge block to end of segment
+            assert icc_challenge
             if ssd.is_end_of_slot():
                 if not validate_eos(
                     cc_challenge, icc_challenge, constants, sub_slot_data, idx, curr_ssi, output_cache, executor
@@ -966,6 +982,7 @@ def _validate_segment(
                 return None
         elif not after_challenge_block and not ssd.is_end_of_slot():
             # overflow blocks before challenge block, compute sp compressed output
+            assert icc_challenge
             if not handle_overflows(
                 cc_challenge, icc_challenge, constants, first_block, idx, output_cache, executor, sub_slot_data
             ):
@@ -994,6 +1011,7 @@ def _validate_segment(
 
         else:
             first_block = False
+    assert icc_challenge
     return prev_challenge_ip_iters, slot_iters, slots, cc_challenge, icc_challenge, slot_after_challenge_block
 
 
@@ -1006,7 +1024,7 @@ def get_cc_sub_slot(
     index: int,
     prev_deficit: int,
     prev_challenge_ip_iters: uint64,
-) -> Tuple[bytes32, bytes32]:
+) -> Tuple[bytes32, Optional[bytes32]]:
     ssd = segment.sub_slot_data[index]
     icc_hash = icc_challenge
     if ssd.icc_slot_end_output is not None:
@@ -1024,6 +1042,7 @@ def get_cc_sub_slot(
                     break
                 if sub_slot.is_end_of_slot():
                     break
+        assert icc_challenge
         icc_hash = VDFInfo(icc_challenge, icc_iters, ssd.icc_slot_end_output).get_hash()
     assert ssd.cc_slot_end_output
     cc_sub_slot = ChallengeChainSubSlot(
@@ -1276,7 +1295,7 @@ def _validate_sub_slot_data(
     ssi: uint64,
     cc_challenge: bytes32,
     prev_cc_sub_slot_hash: Optional[bytes32],
-    icc_challenge: Optional[bytes32],
+    icc_challenge: bytes32,
     long_outputs: Dict[CompressedClassgroupElement, ClassgroupElement],
     executor: ProcessPoolExecutor,
 ) -> bool:
@@ -1597,6 +1616,9 @@ def validate_sub_epoch_sampling(rng: random.Random, sub_epoch_weight_list: List[
     last_l_weight = sub_epoch_weight_list[-1] - sub_epoch_weight_list[-3]
     log.debug(f"total weight {total_weight} prev weight {sub_epoch_weight_list[-2]}")
     weight_to_check = _get_weights_for_sampling(rng, total_weight, last_l_weight)
+    if weight_to_check is None:
+        log.error("failed getting weight list for samples")
+        return False
     sampled_sub_epochs: dict[int, bool] = {}
     for idx in range(1, len(sub_epoch_weight_list)):
         if _sample_sub_epoch(sub_epoch_weight_list[idx - 1], sub_epoch_weight_list[idx], weight_to_check):
@@ -1625,3 +1647,6 @@ def map_segments_by_sub_epoch(
             segments[curr_sub_epoch_n] = []
         segments[curr_sub_epoch_n].append(segment)
     return segments
+
+
+
