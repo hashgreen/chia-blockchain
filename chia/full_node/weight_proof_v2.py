@@ -18,7 +18,8 @@ from chia.full_node.weight_proof_common import (
     blue_boxed_end_of_slot,
     bytes_to_vars,
     _sample_sub_epoch,
-    get_prev_two_slots_height, get_recent_chain,
+    get_prev_two_slots_height,
+    get_recent_chain,
 )
 from chia.types.blockchain_format.classgroup import ClassgroupElement, CompressedClassgroupElement
 from chia.types.blockchain_format.sized_bytes import bytes32
@@ -280,7 +281,9 @@ class WeightProofHandlerV2:
         log.debug("done checking segments")
         return None
 
-    async def __create_persist_sub_epoch(self, prev_ses_block, ses_block, ses_height, sub_epoch_n) -> Optional[List[SubEpochChallengeSegmentV2]]:
+    async def __create_persist_sub_epoch(
+        self, prev_ses_block, ses_block, ses_height, sub_epoch_n
+    ) -> Optional[List[SubEpochChallengeSegmentV2]]:
         segments = await self.blockchain.get_sub_epoch_challenge_segments_v2(ses_block.header_hash)
         if segments is None:
             segments = await self.__create_sub_epoch_segments(ses_block, prev_ses_block, uint32(sub_epoch_n))
