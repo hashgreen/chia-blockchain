@@ -81,26 +81,17 @@ class VDFProof(Streamable):
             return False
         if self.witness_type + 1 > constants.MAX_VDF_WITNESS_SIZE:
             return False
-        return is_valid_inner(self, constants.DISCRIMINANT_SIZE_BITS, input_el, info)
-
-
-def is_valid_inner(
-    proof: VDFProof,
-    desc_size: int,
-    input_el: ClassgroupElement,
-    info: VDFInfo,
-) -> bool:
-    try:
-        return verify_vdf(
-            get_discriminant(info.challenge, desc_size),
-            input_el.data,
-            info.output.data + bytes(proof.witness),
-            info.number_of_iterations,
-            desc_size,
-            proof.witness_type,
-        )
-    except Exception:
-        return False
+        try:
+            return verify_vdf(
+                get_discriminant(info.challenge, constants.DISCRIMINANT_SIZE_BITS),
+                input_el.data,
+                info.output.data + bytes(self.witness),
+                info.number_of_iterations,
+                constants.DISCRIMINANT_SIZE_BITS,
+                self.witness_type,
+            )
+        except Exception:
+            return False
 
 
 # Stores, for a given VDF, the field that uses it.
@@ -120,6 +111,22 @@ def compress_output(
     number_of_iterations: uint64,
     executor: ProcessPoolExecutor,
 ):
+    def compress_future(
+        disc: str,
+        output: bytes,
+        input: bytes,
+        proof: bytes,
+        number_of_iterations: uint64,
+        proof_type: int,
+    ):
+        return get_b_from_n_wesolowski(
+            disc,
+            input,
+            output + proof,
+            number_of_iterations,
+            proof_type,
+        )
+
     future = executor.submit(
         compress_future,
         str(get_discriminant(challenge, disc_size)),
@@ -133,25 +140,7 @@ def compress_output(
     return future
 
 
-def compress_future(
-    disc: str,
-    output: bytes,
-    input: bytes,
-    proof: bytes,
-    number_of_iterations: uint64,
-    proof_type: int,
-):
-    return get_b_from_n_wesolowski(
-        disc,
-        input,
-        output + proof,
-        number_of_iterations,
-        proof_type,
-    )
-
-
 def verify_compressed_vdf(
-    executor: ProcessPoolExecutor,
     constants: ConsensusConstants,
     challenge: bytes32,
     vdf_input: ClassgroupElement,
@@ -160,10 +149,8 @@ def verify_compressed_vdf(
     number_of_iterations: uint64,
 ):
     if proof.witness_type + 1 > constants.MAX_VDF_WITNESS_SIZE:
-        log.error(f"invalid witness type")
-        return None
-    res = executor.submit(
-        verify_compressed_future,
+        raise Exception(f"invalid witness type")
+    x, y = verify_n_wesolowski_with_b(
         str(get_discriminant(challenge, constants.DISCRIMINANT_SIZE_BITS)),
         f"0x{vdf_output.data.hex()}",
         bytes(vdf_input.data),
@@ -171,53 +158,4 @@ def verify_compressed_vdf(
         number_of_iterations,
         proof.witness_type,
     )
-    return res
-
-
-def verify_compressed_future(
-    disc: str,
-    output: str,
-    input: bytes,
-    proof: bytes,
-    number_of_iterations: uint64,
-    proof_type: int,
-):
-    return verify_n_wesolowski_with_b(
-        disc,
-        output,
-        input,
-        proof,
-        number_of_iterations,
-        proof_type,
-    )
-
-
-async def is_valid(
-    executor: ProcessPoolExecutor,
-    proof: VDFProof,
-    constants: ConsensusConstants,
-    input_el: ClassgroupElement,
-    info: VDFInfo,
-    target_vdf_info: Optional[VDFInfo] = None,
-):
-    if target_vdf_info is not None and info != target_vdf_info:
-        tb = traceback.format_stack()
-        log.error(f"{tb} INVALID VDF INFO. Have: {info} Expected: {target_vdf_info}")
-        return None
-    if proof.witness_type + 1 > constants.MAX_VDF_WITNESS_SIZE:
-        log.error(f"invalid witness type")
-        return None
-    return executor.submit(is_valid_inner, proof, constants.DISCRIMINANT_SIZE_BITS, input_el, info)
-
-
-def get_vdf_result(future):
-    if future is None:
-        raise Exception("vdf future was None")
-    x, y = future.result()
     return x, ClassgroupElement.from_bytes(y)
-
-
-def get_compress_result(future):
-    if future is None:
-        raise Exception("compress future was None")
-    return CompressedClassgroupElement.from_hex(future.result())
