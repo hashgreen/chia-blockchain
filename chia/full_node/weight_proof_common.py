@@ -20,6 +20,48 @@ from chia.types.end_of_slot_bundle import EndOfSubSlotBundle
 log = logging.getLogger(__name__)
 
 
+async def get_recent_chain(blockchain:BlockchainInterface, tip_height: uint32) -> Optional[List[HeaderBlock]]:
+    recent_chain: List[HeaderBlock] = []
+    ses_heights = blockchain.get_ses_heights()
+    min_height = 0
+    count_ses = 0
+    for ses_height in reversed(ses_heights):
+        if ses_height <= tip_height:
+            count_ses += 1
+        if count_ses == 2:
+            min_height = ses_height - 1
+            break
+    log.debug(f"start {min_height} end {tip_height}")
+    headers = await blockchain.get_header_blocks_in_range(min_height, tip_height, tx_filter=False)
+    blocks = await blockchain.get_block_records_in_range(min_height, tip_height)
+    ses_count = 0
+    curr_height = tip_height
+    blocks_n = 0
+    while ses_count < 2:
+        if curr_height == 0:
+            break
+        # add to needed reward chain recent blocks
+        header_block = headers[blockchain.height_to_hash(curr_height)]
+        block_rec = blocks[header_block.header_hash]
+        if header_block is None:
+            log.error("creating recent chain failed")
+            return None
+        recent_chain.insert(0, header_block)
+        if block_rec.sub_epoch_summary_included:
+            ses_count += 1
+        curr_height = uint32(curr_height - 1)
+        blocks_n += 1
+
+    header_block = headers[blockchain.height_to_hash(curr_height)]
+    recent_chain.insert(0, header_block)
+
+    log.info(
+        f"recent chain, "
+        f"start: {recent_chain[0].reward_chain_block.height} "
+        f"end:  {recent_chain[-1].reward_chain_block.height} "
+    )
+    return recent_chain
+
 def blue_boxed_end_of_slot(sub_slot: EndOfSubSlotBundle):
     if sub_slot.proofs.challenge_chain_slot_proof.normalized_to_identity:
         if sub_slot.proofs.infused_challenge_chain_slot_proof is not None:

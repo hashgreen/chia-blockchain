@@ -526,7 +526,7 @@ class TestWeightProof:
     # @pytest.mark.skip("used for debugging")
     @pytest.mark.asyncio
     async def test_weight_proof_from_database(self):
-        db_path = "/Users/almog/.chia/mainnet/db/blockchain_v1_mainnet.sqlite"
+        db_path = "path to db file"
         connection = await aiosqlite.connect(db_path)
         config = load_config(DEFAULT_ROOT_PATH, "config.yaml", SERVICE_NAME)
         overrides = config["network_overrides"]["constants"]["mainnet"]
@@ -545,7 +545,7 @@ class TestWeightProof:
         hint_store = await HintStore.create(wrapper)
         coin_store = await CoinStore.create(wrapper)
         blockchain = await Blockchain.create(
-            coin_store, block_store, updated_constants, hint_store, Path("/Users/almog/.chia/mainnet/db/")
+            coin_store, block_store, updated_constants, hint_store, Path("path to db folder")
         )
         peak = blockchain.get_peak()
         # peak_height = peak.height

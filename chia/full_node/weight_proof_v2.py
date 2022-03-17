@@ -18,7 +18,7 @@ from chia.full_node.weight_proof_common import (
     blue_boxed_end_of_slot,
     bytes_to_vars,
     _sample_sub_epoch,
-    get_prev_two_slots_height,
+    get_prev_two_slots_height, get_recent_chain,
 )
 from chia.types.blockchain_format.classgroup import ClassgroupElement, CompressedClassgroupElement
 from chia.types.blockchain_format.sized_bytes import bytes32
@@ -172,7 +172,7 @@ class WeightProofHandlerV2:
             log.error("failed not tip in cache")
             return None
         log.info(f"create weight proof peak {tip} {tip_rec.height}")
-        recent_chain_task = self._get_recent_chain(tip_rec.height)
+        recent_chain_task = get_recent_chain(self.blockchain, tip_rec.height)
         summary_heights = self.blockchain.get_ses_heights()
         sub_epoch_data = await self.get_sub_epoch_data(tip_rec.height, summary_heights)
         rng = random.Random(seed)
@@ -215,15 +215,10 @@ class WeightProofHandlerV2:
 
             if _sample_sub_epoch(prev_ses_block.weight, ses_block.weight, weight_to_check):
                 sample_n += 1
-                segments = await self.blockchain.get_sub_epoch_challenge_segments_v2(ses_block.header_hash)
+                segments = await self.__create_persist_sub_epoch(prev_ses_block, ses_block, ses_height, sub_epoch_n)
                 if segments is None:
-                    segments = await self.__create_sub_epoch_segments(ses_block, prev_ses_block, uint32(sub_epoch_n))
-                    if segments is None:
-                        log.error(
-                            f"failed while building segments for sub epoch {sub_epoch_n}, ses height {ses_height} "
-                        )
-                        return None
-                    await self.blockchain.persist_sub_epoch_challenge_segments_v2(ses_block.header_hash, segments)
+                    log.error(f"error while building sub epoch {sub_epoch_n}")
+                    return None
                 # remove proofs from unsampled
                 sampled_seg_index = rng.choice(range(len(segments)))
                 segments = compress_segments(sampled_seg_index, segments)
@@ -252,48 +247,6 @@ class WeightProofHandlerV2:
                 return last_ses_block, prev_prev_ses_block
         return None, None
 
-    async def _get_recent_chain(self, tip_height: uint32) -> Optional[List[HeaderBlock]]:
-        recent_chain: List[HeaderBlock] = []
-        ses_heights = self.blockchain.get_ses_heights()
-        min_height = 0
-        count_ses = 0
-        for ses_height in reversed(ses_heights):
-            if ses_height <= tip_height:
-                count_ses += 1
-            if count_ses == 2:
-                min_height = ses_height - 1
-                break
-        log.debug(f"start {min_height} end {tip_height}")
-        headers = await self.blockchain.get_header_blocks_in_range(min_height, tip_height, tx_filter=False)
-        blocks = await self.blockchain.get_block_records_in_range(min_height, tip_height)
-        ses_count = 0
-        curr_height = tip_height
-        blocks_n = 0
-        while ses_count < 2:
-            if curr_height == 0:
-                break
-            # add to needed reward chain recent blocks
-            header_block = headers[self.blockchain.height_to_hash(curr_height)]
-            block_rec = blocks[header_block.header_hash]
-            if header_block is None:
-                log.error("creating recent chain failed")
-                return None
-            recent_chain.insert(0, header_block)
-            if block_rec.sub_epoch_summary_included:
-                ses_count += 1
-            curr_height = uint32(curr_height - 1)
-            blocks_n += 1
-
-        header_block = headers[self.blockchain.height_to_hash(curr_height)]
-        recent_chain.insert(0, header_block)
-
-        log.info(
-            f"recent chain, "
-            f"start: {recent_chain[0].reward_chain_block.height} "
-            f"end:  {recent_chain[-1].reward_chain_block.height} "
-        )
-        return recent_chain
-
     async def create_sub_epoch_segments(self):
         log.debug("check segments in db")
         """
@@ -321,13 +274,13 @@ class WeightProofHandlerV2:
             if ses_block is None or ses_block.sub_epoch_summary_included is None:
                 log.error("error while building proof")
                 return None
-            await self.__create_persist_segment(prev_ses_block, ses_block, ses_height, sub_epoch_n)
+            await self.__create_persist_sub_epoch(prev_ses_block, ses_block, ses_height, sub_epoch_n)
             prev_ses_block = ses_block
             await asyncio.sleep(2)
         log.debug("done checking segments")
         return None
 
-    async def __create_persist_segment(self, prev_ses_block, ses_block, ses_height, sub_epoch_n):
+    async def __create_persist_sub_epoch(self, prev_ses_block, ses_block, ses_height, sub_epoch_n) -> Optional[List[SubEpochChallengeSegmentV2]]:
         segments = await self.blockchain.get_sub_epoch_challenge_segments_v2(ses_block.header_hash)
         if segments is None:
             segments = await self.__create_sub_epoch_segments(ses_block, prev_ses_block, uint32(sub_epoch_n))
@@ -335,6 +288,7 @@ class WeightProofHandlerV2:
                 log.error(f"failed while building segments for sub epoch {sub_epoch_n}, ses height {ses_height} ")
                 return None
             await self.blockchain.persist_sub_epoch_challenge_segments_v2(ses_block.header_hash, segments)
+        return segments
 
     async def create_prev_sub_epoch_segments(self):
         log.debug("create prev sub_epoch_segments")
@@ -822,9 +776,8 @@ def _validate_sub_epoch_segments(
     summaries_bytes: List[bytes],
     executor: ProcessPoolExecutor,
 ) -> bool:
-    segments_by_sub_epoch = map_segments_by_sub_epoch(sub_epoch_segments)
     ses_futures = []
-    for sub_epoch_n, segments in segments_by_sub_epoch.items():
+    for sub_epoch_n, segments in map_segments_by_sub_epoch(sub_epoch_segments).items():
         sampled_seg_index = rng.choice(range(len(segments)))
         ses_futures.append(
             executor.submit(
@@ -836,9 +789,9 @@ def _validate_sub_epoch_segments(
                 summaries_bytes,
             )
         )
-    for x in as_completed(ses_futures):
-        log.info("sub epoch done")
-        if x.result() is False:
+    for idx, x in enumerate(as_completed(ses_futures)):
+        log.info(f"sampled sub epoch {idx} out of {len(ses_futures)} validation done")
+        if x is False:
             return False
 
     return True
@@ -847,8 +800,7 @@ def _validate_sub_epoch_segments(
 def validate_sub_epoch(constants_dict, sampled_seg_index, segment_bytes, sub_epoch_n, summaries_bytes):
     log.info(f"validate sub epoch {sub_epoch_n}")
     prev_ses: Optional[SubEpochSummary] = None
-    total_blocks, total_ip_iters = 0, 0
-    total_ip_iters, total_slot_iters, total_slots = 0, 0, 0
+    total_blocks, total_ip_iters, total_slot_iters, total_slots = 0, 0, 0, 0
     constants, summaries = bytes_to_vars(constants_dict, summaries_bytes)
     segments = SubEpochSegmentsV2.from_bytes(segment_bytes).challenge_segments
     # recreate RewardChainSubSlot for next ses rc_hash
@@ -873,41 +825,37 @@ def validate_sub_epoch(constants_dict, sampled_seg_index, segment_bytes, sub_epo
         return False
     ip_iters = uint64(0)
     slot_after_challenge = False
-    with ProcessPoolExecutor() as executor:
-        for idx, segment in enumerate(segments):
-            log.debug(f"validate segment {idx} sampled:{sampled_seg_index == idx}")
-            res = _validate_segment(
-                constants,
-                segment,
-                curr_ssi,
-                curr_difficulty,
-                prev_ses if idx == 0 else None,
-                sampled_seg_index == idx,
-                cc_sub_slot_hash,
-                icc_sub_slot_hash,
-                uint64(0) if slot_after_challenge else ip_iters,
-                executor,
-            )
-            if res is None:
-                log.error(f"failed to validate sub_epoch {segment.sub_epoch_n} segment {idx} slots")
-                return False
-            ip_iters, slot_iters, slots, cc_sub_slot_hash, icc_sub_slot_hash, slot_after_challenge = res
-            log.debug(f"cc sub slot hash {cc_sub_slot_hash}")
-            if prev_ses is not None and prev_ses.new_sub_slot_iters is not None:
-                curr_ssi = prev_ses.new_sub_slot_iters
-            if prev_ses is not None and prev_ses.new_difficulty is not None:
-                curr_difficulty = prev_ses.new_difficulty
+    for idx, segment in enumerate(segments):
+        log.debug(f"validate segment {idx} sampled:{sampled_seg_index == idx}")
+        res = _validate_segment(
+            constants,
+            segment,
+            curr_ssi,
+            curr_difficulty,
+            prev_ses if idx == 0 else None,
+            sampled_seg_index == idx,
+            cc_sub_slot_hash,
+            icc_sub_slot_hash,
+            uint64(0) if slot_after_challenge else ip_iters,
+        )
+        if res is None:
+            log.error(f"failed to validate sub_epoch {segment.sub_epoch_n} segment {idx} slots")
+            return False
+        ip_iters, slot_iters, slots, cc_sub_slot_hash, icc_sub_slot_hash, slot_after_challenge = res
+        log.debug(f"cc sub slot hash {cc_sub_slot_hash}")
+        if prev_ses is not None and prev_ses.new_sub_slot_iters is not None:
+            curr_ssi = prev_ses.new_sub_slot_iters
+        if prev_ses is not None and prev_ses.new_difficulty is not None:
+            curr_difficulty = prev_ses.new_difficulty
 
-            total_blocks += 1
-            total_slot_iters += slot_iters
-            total_slots += slots
-            total_ip_iters += ip_iters
-            avg_ip_iters = total_ip_iters / total_blocks
-            avg_slot_iters = total_slot_iters / total_slots
-            if avg_slot_iters / avg_ip_iters < float(constants.WEIGHT_PROOF_THRESHOLD):
-                log.error(f"bad avg challenge block positioning ratio: {avg_slot_iters / avg_ip_iters}")
-                return False
-    log.info(f"validated sub epoch {sub_epoch_n}")
+        total_blocks += 1
+        total_slot_iters += slot_iters * slots
+        total_slots += slots
+        total_ip_iters += ip_iters
+    avg_ip_iters = total_ip_iters / total_blocks
+    avg_slot_iters = total_slot_iters / total_slots
+    if avg_slot_iters / avg_ip_iters < float(constants.WEIGHT_PROOF_THRESHOLD):
+        log.error(f"bad avg challenge block positioning ratio: {avg_slot_iters / avg_ip_iters}")
     return True
 
 
@@ -921,7 +869,6 @@ def _validate_segment(
     cc_challenge: bytes32,
     icc_challenge: Optional[bytes32],
     prev_challenge_ip_iters: uint64,
-    executor: ProcessPoolExecutor,
 ) -> Optional[Tuple[uint64, uint64, int, bytes32, bytes32, bool]]:
     slot_iters, slots = uint64(0), 0
 

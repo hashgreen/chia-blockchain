@@ -21,7 +21,7 @@ from chia.full_node.weight_proof_common import (
     _validate_summaries_weight,
     bytes_to_vars,
     _sample_sub_epoch,
-    get_prev_two_slots_height,
+    get_prev_two_slots_height, get_recent_chain,
 )
 from chia.types.blockchain_format.classgroup import ClassgroupElement
 from chia.types.blockchain_format.sized_bytes import bytes32
@@ -106,7 +106,7 @@ class WeightProofHandler:
             log.error("failed not tip in cache")
             return None
         log.info(f"create weight proof peak {tip} {tip_rec.height}")
-        recent_chain = await self._get_recent_chain(tip_rec.height)
+        recent_chain = await get_recent_chain(self.blockchain, tip_rec.height)
         if recent_chain is None:
             return None
 
@@ -173,54 +173,6 @@ class WeightProofHandler:
         assert ses is not None
         seed = ses.get_hash()
         return seed
-
-    async def _get_recent_chain(self, tip_height: uint32) -> Optional[List[HeaderBlock]]:
-        recent_chain: List[HeaderBlock] = []
-        ses_heights = self.blockchain.get_ses_heights()
-        min_height = 0
-        count_ses = 0
-        for ses_height in reversed(ses_heights):
-            if ses_height <= tip_height:
-                count_ses += 1
-            if count_ses == 2:
-                min_height = ses_height - 1
-                break
-        log.debug(f"start {min_height} end {tip_height}")
-        headers = await self.blockchain.get_header_blocks_in_range(min_height, tip_height, tx_filter=False)
-        blocks = await self.blockchain.get_block_records_in_range(min_height, tip_height)
-        ses_count = 0
-        curr_height = tip_height
-        blocks_n = 0
-        while ses_count < 2:
-            if curr_height == 0:
-                break
-            # add to needed reward chain recent blocks
-            # TODO: address hint error and remove ignore
-            #       error: Invalid index type "Optional[bytes32]" for "Dict[bytes32, HeaderBlock]"; expected type
-            #       "bytes32"  [index]
-            header_block = headers[self.blockchain.height_to_hash(curr_height)]  # type: ignore[index]
-            block_rec = blocks[header_block.header_hash]
-            if header_block is None:
-                log.error("creating recent chain failed")
-                return None
-            recent_chain.insert(0, header_block)
-            if block_rec.sub_epoch_summary_included:
-                ses_count += 1
-            curr_height = uint32(curr_height - 1)
-            blocks_n += 1
-
-        # TODO: address hint error and remove ignore
-        #       error: Invalid index type "Optional[bytes32]" for "Dict[bytes32, HeaderBlock]"; expected type "bytes32"
-        #       [index]
-        header_block = headers[self.blockchain.height_to_hash(curr_height)]  # type: ignore[index]
-        recent_chain.insert(0, header_block)
-
-        log.info(
-            f"recent chain, "
-            f"start: {recent_chain[0].reward_chain_block.height} "
-            f"end:  {recent_chain[-1].reward_chain_block.height} "
-        )
-        return recent_chain
 
     async def create_prev_sub_epoch_segments(self):
         log.debug("create prev sub_epoch_segments")
