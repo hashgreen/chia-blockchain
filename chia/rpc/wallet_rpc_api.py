@@ -15,6 +15,7 @@ from chia.simulator.simulator_protocol import FarmNewBlockProtocol
 from chia.types.announcement import Announcement
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.sized_bytes import bytes32
+from chia.types.coin_record import CoinRecord
 from chia.types.spend_bundle import SpendBundle
 from chia.util.bech32m import decode_puzzle_hash, encode_puzzle_hash
 from chia.util.byte_types import hexstr_to_bytes
@@ -33,6 +34,7 @@ from chia.wallet.trading.offer import Offer
 from chia.wallet.transaction_record import TransactionRecord
 from chia.wallet.util.transaction_type import TransactionType
 from chia.wallet.util.wallet_types import AmountWithPuzzlehash, WalletType
+from chia.wallet.wallet_coin_record import WalletCoinRecord
 from chia.wallet.wallet_info import WalletInfo
 from chia.wallet.wallet_node import WalletNode
 from chia.util.config import load_config
@@ -81,6 +83,7 @@ class WalletRpcApi:
             "/get_transactions": self.get_transactions,
             "/get_transaction_count": self.get_transaction_count,
             "/get_next_address": self.get_next_address,
+            "/get_coin_records": self.get_coin_records,
             "/send_transaction": self.send_transaction,
             "/send_transaction_multi": self.send_transaction_multi,
             "/get_farmed_amount": self.get_farmed_amount,
@@ -91,6 +94,7 @@ class WalletRpcApi:
             "/cat_asset_id_to_name": self.cat_asset_id_to_name,
             "/cat_get_name": self.cat_get_name,
             "/cat_spend": self.cat_spend,
+            "/cat_spend_multi": self.cat_spend_multi,
             "/cat_get_asset_id": self.cat_get_asset_id,
             "/create_offer_for_ids": self.create_offer_for_ids,
             "/get_offer_summary": self.get_offer_summary,
@@ -741,6 +745,32 @@ class WalletRpcApi:
             "address": address,
         }
 
+    async def get_coin_records(self, request: Dict) -> Dict:
+        wallet_id = uint32(int(request["wallet_id"]))
+        wallet = self.service.wallet_state_manager.wallets[wallet_id]
+        records: List[WalletCoinRecord] = list(
+            await wallet.wallet_state_manager.get_spendable_coins_for_wallet(wallet_id))
+        unconfirmed_removals: Dict[bytes32, Coin] = (
+            await wallet.wallet_state_manager.unconfirmed_removals_for_wallet(wallet_id))
+
+        coin_records = []
+        for record in records:
+            if record.coin.name() in unconfirmed_removals:
+                continue
+
+            coin_records.append(CoinRecord(
+                coin=record.coin,
+                confirmed_block_index=record.confirmed_block_height,
+                spent_block_index=record.spent_block_height,
+                spent=False,
+                coinbase=record.coinbase,
+                timestamp=0))
+
+        return {
+            "wallet_id": wallet_id,
+            "coin_records": coin_records,
+        }
+
     async def send_transaction(self, request):
         assert self.service.wallet_state_manager is not None
 
@@ -867,6 +897,57 @@ class WalletRpcApi:
         return {
             "transaction": tx.to_json_dict_convenience(self.service.config),
             "transaction_id": tx.name,
+        }
+
+    async def cat_spend_multi(self, request):
+        assert self.service.wallet_state_manager is not None
+
+        if await self.service.wallet_state_manager.synced() is False:
+            raise ValueError("Wallet needs to be fully synced.")
+        wallet_id = int(request["wallet_id"])
+        wallet: CATWallet = self.service.wallet_state_manager.wallets[wallet_id]
+
+        additions: List[Dict] = request["additions"]
+
+        outputs = []
+        for addition in additions:
+            if not isinstance(addition["amount"], int):
+                raise ValueError(
+                    "An integer amount or fee is required (too many decimals)"
+                )
+
+            amount: uint64 = addition["amount"]
+            puzzle_hash: bytes32 = decode_puzzle_hash(addition["inner_address"])
+            memos = (
+                []
+                if "memos" not in addition
+                else [mem.encode("utf-8") for mem in addition["memos"]]
+            )
+            outputs.append(
+                {"puzzlehash": puzzle_hash, "amount": amount, "memos": memos}
+            )
+
+        if "fee" in request:
+            fee = uint64(request["fee"])
+        else:
+            fee = uint64(0)
+
+        async with self.service.wallet_state_manager.lock:
+            txs: List[TransactionRecord] = await wallet.generate_signed_transaction(
+                [output["amount"] for output in outputs],
+                [output["puzzlehash"] for output in outputs],
+                fee,
+                memos=[output["memos"] for output in outputs],
+            )
+
+            push = request.get("push", True)
+            if push:
+                for tx in txs:
+                    await wallet.standard_wallet.push_transaction(tx)
+
+        return {
+            "transaction": txs[0].to_json_dict_convenience(self.service.config),
+            "transaction_id": txs[0].name,
         }
 
     async def cat_get_asset_id(self, request):
