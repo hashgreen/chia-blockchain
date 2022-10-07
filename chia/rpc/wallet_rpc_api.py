@@ -1,10 +1,9 @@
 import asyncio
-from contextlib import nullcontext
 import dataclasses
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union, AsyncContextManager
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from blspy import G1Element, G2Element, PrivateKey
 
@@ -2182,13 +2181,7 @@ class WalletRpcApi:
                 for announcement in request["puzzle_announcements"]
             }
 
-        lock: AsyncContextManager[None]
-        if hold_lock:
-            lock = self.service.wallet_state_manager.lock
-        else:
-            lock = nullcontext()
-
-        async with lock:
+        async def _generate_signed_transaction() -> EndpointResult:
             if isinstance(wallet, Wallet):
                 tx = await wallet.generate_signed_transaction(
                     amount_0,
@@ -2206,7 +2199,10 @@ class WalletRpcApi:
                 signed_tx = tx.to_json_dict_convenience(self.service.config)
 
                 return {"signed_txs": [signed_tx], "signed_tx": signed_tx}
+
             else:
+                assert isinstance(wallet, CATWallet)
+
                 txs = await wallet.generate_signed_transaction(
                     [amount_0] + [output["amount"] for output in additional_outputs],
                     [bytes32(puzzle_hash_0)] + [output["puzzlehash"] for output in additional_outputs],
@@ -2221,6 +2217,12 @@ class WalletRpcApi:
                 signed_txs = [tx.to_json_dict_convenience(self.service.config) for tx in txs]
 
                 return {"signed_txs": signed_txs, "signed_tx": signed_txs[0]}
+
+        if hold_lock:
+            async with self.service.wallet_state_manager.lock:
+                return await _generate_signed_transaction()
+        else:
+            return await _generate_signed_transaction()
 
     ##########################################################################################
     # Pool Wallet
